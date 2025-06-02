@@ -2,6 +2,7 @@ package sup
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -26,11 +27,12 @@ type Supfile struct {
 
 // Network is group of hosts with extra custom env vars.
 type Network struct {
-	Env             EnvList  `yaml:"env"`
-	Inventory       string   `yaml:"inventory"`
-	Hosts           []*Host  `yaml:"-"`
-	HostsFromConfig []string `yaml:"hosts"`
-	Bastion         string   `yaml:"bastion"` // Jump host for the environment
+	Env              EnvList  `yaml:"env"`
+	Inventory        string   `yaml:"inventory"`
+	AnsibleInventory string   `yaml:"ansible_inventory"`
+	Hosts            []*Host  `yaml:"-"`
+	HostsFromConfig  []string `yaml:"hosts"`
+	Bastion          string   `yaml:"bastion"` // Jump host for the environment
 }
 
 func (n *Network) UnmarshalYAML(unmarshal func(interface{}) error) error {
@@ -432,9 +434,29 @@ func NewSupfile(data []byte) (*Supfile, error) {
 	return &conf, nil
 }
 
+// AnsibleInventory represents the JSON output from ansible-inventory command
+type AnsibleInventory struct {
+	Meta struct {
+		Hostvars map[string]map[string]interface{} `json:"hostvars"`
+	} `json:"_meta"`
+	All struct {
+		Children []string `json:"children"`
+	} `json:"all"`
+	// Other groups will be parsed from remaining fields
+	Groups map[string]struct {
+		Hosts []string `json:"hosts"`
+	} `json:"-"`
+}
+
 // ParseInventory runs the inventory command, if provided, and appends
 // the command's output lines to the manually defined list of hosts.
 func (n Network) ParseInventory() ([]*Host, error) {
+	// Check if Ansible inventory is specified
+	if n.AnsibleInventory != "" {
+		return n.parseAnsibleInventory()
+	}
+
+	// Check if regular inventory command is specified
 	if n.Inventory == "" {
 		return nil, nil
 	}
@@ -467,5 +489,83 @@ func (n Network) ParseInventory() ([]*Host, error) {
 
 		hosts = append(hosts, &Host{Address: host})
 	}
+	return hosts, nil
+}
+
+// parseAnsibleInventory runs the ansible-inventory command and parses its JSON output
+// to get hosts from the inventory file
+func (n Network) parseAnsibleInventory() ([]*Host, error) {
+	// Run ansible-inventory command to get JSON output
+	cmd := exec.Command("ansible-inventory", "-i", n.AnsibleInventory, "--list")
+	cmd.Env = os.Environ()
+	cmd.Env = append(cmd.Env, n.Env.Slice()...)
+	cmd.Stderr = os.Stderr
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, errors.Wrap(err, "running ansible-inventory command failed")
+	}
+
+	// Parse JSON output
+	var inventory AnsibleInventory
+	err = json.Unmarshal(output, &inventory)
+	if err != nil {
+		return nil, errors.Wrap(err, "parsing ansible inventory JSON failed")
+	}
+
+	// Process all fields except _meta and all as potential group entries
+	var unmarshalledData map[string]interface{}
+	err = json.Unmarshal(output, &unmarshalledData)
+	if err != nil {
+		return nil, errors.Wrap(err, "re-parsing ansible inventory JSON failed")
+	}
+
+	// Extract all hosts from all groups
+	hostMap := make(map[string]bool)
+	for groupName, groupData := range unmarshalledData {
+		// Skip _meta and all fields as they're processed differently
+		if groupName == "_meta" || groupName == "all" {
+			continue
+		}
+
+		// Extract hosts array from the group
+		groupMap, ok := groupData.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		hostsArray, ok := groupMap["hosts"].([]interface{})
+		if !ok {
+			continue
+		}
+
+		// Add each host to our unique host map
+		for _, hostEntry := range hostsArray {
+			host, ok := hostEntry.(string)
+			if ok {
+				hostMap[host] = true
+			}
+		}
+	}
+
+	// Convert to a slice of Host pointers
+	var hosts []*Host
+	for hostname := range hostMap {
+		// Check if the host has an ansible_host variable in hostvars
+		address := hostname
+		if hostVars, ok := inventory.Meta.Hostvars[hostname]; ok {
+			if ansibleHost, ok := hostVars["ansible_host"].(string); ok && ansibleHost != "" {
+				address = ansibleHost
+			}
+		}
+
+		// Process through NewHost just like hosts defined directly in Supfile
+		// This ensures consistent handling of SSH config
+		host, err := NewHost(address)
+		if err != nil {
+			return nil, errors.Wrap(err, fmt.Sprintf("failed to create host from %s", address))
+		}
+		hosts = append(hosts, host)
+	}
+
 	return hosts, nil
 }
