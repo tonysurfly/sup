@@ -58,6 +58,27 @@ networks:
 
 `$ sup production COMMAND` will run COMMAND on `api1`, `api2` and `api3` hosts in parallel.
 
+### Using Ansible Inventory Files
+
+Sup can also load hosts from Ansible-compatible inventory files (INI format). This is useful if you already manage your infrastructure using Ansible.
+
+To use an inventory file, specify the `inventoryfile` field in your network configuration:
+
+```yaml
+# Supfile
+
+networks:
+  production:
+    inventoryfile: /path/to/your/ansible_hosts.ini
+    # You can still define hosts directly, they will be merged with hosts from the inventory file
+    # hosts:
+    #   - additional_host.example.com
+```
+
+Sup will parse the INI file and add all hosts found to the specified network. If a host is defined in both `hosts` and the `inventoryfile`, it will be included. Sup leverages the `github.com/relex/aini` library for parsing, which primarily supports the INI format. While `aini` might handle YAML inventories if the file has a `.yml` or `.yaml` extension, INI is the most robustly supported format.
+
+**Note:** If both `inventory` (for dynamic host fetching) and `inventoryfile` are specified for a network, `inventoryfile` will take precedence.
+
 ## Command
 
 A shell command(s) to be run remotely.

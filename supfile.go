@@ -11,7 +11,7 @@ import (
 	"strings"
 
 	"github.com/pkg/errors"
-
+	"github.com/relex/aini"
 	"gopkg.in/yaml.v2"
 )
 
@@ -28,16 +28,25 @@ type Supfile struct {
 type Network struct {
 	Env             EnvList  `yaml:"env"`
 	Inventory       string   `yaml:"inventory"`
+	InventoryFile   string   `yaml:"inventoryfile"`
 	Hosts           []*Host  `yaml:"-"`
 	HostsFromConfig []string `yaml:"hosts"`
 	Bastion         string   `yaml:"bastion"` // Jump host for the environment
 }
 
 func (n *Network) UnmarshalYAML(unmarshal func(interface{}) error) error {
-	type NewNetwork Network
-	if err := unmarshal((*NewNetwork)(n)); err != nil {
+	type Alias Network // Use alias to avoid recursion
+	aux := &struct {
+		InventoryFile string `yaml:"inventoryfile"`
+		*Alias
+	}{
+		Alias: (*Alias)(n),
+	}
+	if err := unmarshal(aux); err != nil {
 		return err
 	}
+	n.InventoryFile = aux.InventoryFile
+
 	for _, item := range n.HostsFromConfig {
 		host, err := NewHost(item)
 		if err != nil {
@@ -423,7 +432,7 @@ func NewSupfile(data []byte) (*Supfile, error) {
 
 		fallthrough
 
-	case "0.4", "0.5":
+	case "0.4", "0.5", "0.6":
 
 	default:
 		return nil, ErrUnsupportedSupfileVersion{"unsupported Supfile version " + conf.Version}
@@ -432,40 +441,77 @@ func NewSupfile(data []byte) (*Supfile, error) {
 	return &conf, nil
 }
 
-// ParseInventory runs the inventory command, if provided, and appends
-// the command's output lines to the manually defined list of hosts.
-func (n Network) ParseInventory() ([]*Host, error) {
-	if n.Inventory == "" {
-		return nil, nil
-	}
-
-	cmd := exec.Command("/bin/sh", "-c", n.Inventory)
-	cmd.Env = os.Environ()
-	cmd.Env = append(cmd.Env, n.Env.Slice()...)
-	cmd.Stderr = os.Stderr
-	output, err := cmd.Output()
-	if err != nil {
-		return nil, err
-	}
-
+// ParseInventory runs the inventory command or parses inventory file, if provided,
+// and appends the command's output lines to the manually defined list of hosts.
+func (n *Network) ParseInventory() ([]*Host, error) {
 	var hosts []*Host
-	buf := bytes.NewBuffer(output)
-	for {
-		host, err := buf.ReadString('\n')
+
+	if n.InventoryFile != "" {
+		inventory, err := aini.ParseFile(n.InventoryFile)
 		if err != nil {
-			if err == io.EOF {
-				break
+			return nil, errors.Wrap(err, "failed to parse inventory file")
+		}
+		for _, hostData := range inventory.Hosts {
+			host, err := NewHost(hostData.Name)
+			if err != nil {
+				// TODO: consider whether to skip invalid hosts or return error
+				return nil, errors.Wrapf(err, "failed to parse host %s", hostData.Name)
 			}
+			// User is overridden if ansible_user is in hostData.Vars.
+			// This ensures host-specific ansible_user takes precedence over user in host string or default from NewHost.
+			if user, ok := hostData.Vars["ansible_user"]; ok {
+				host.User = user
+			}
+
+			// Port resolution:
+			// NewHost sets a default port ("22") or parses it if hostData.Name (e.g. ansible_host) contains "name:port".
+			// It also might get a port from SSH config.
+			// The following logic ensures ansible inventory ports take precedence.
+			if portVal, ok := hostData.Vars["ansible_port"]; ok {
+				// ansible_port from host variables (host > group > all) takes highest precedence after NewHost.
+				host.Port = portVal
+			} else if hostData.Port != 0 {
+				// If aini.HostData.Port is set (e.g. from "host:port" syntax in inventory, not captured as a var)
+				// and ansible_port was not in Vars, use this.
+				host.Port = fmt.Sprintf("%d", hostData.Port)
+			}
+			// If neither of the above, host.Port remains what NewHost determined (default, name:port, or ssh config).
+
+			hosts = append(hosts, host)
+		}
+	} else if n.Inventory != "" {
+		cmd := exec.Command("/bin/sh", "-c", n.Inventory)
+		cmd.Env = os.Environ()
+		cmd.Env = append(cmd.Env, n.Env.Slice()...)
+		cmd.Stderr = os.Stderr
+		output, err := cmd.Output()
+		if err != nil {
 			return nil, err
 		}
 
-		host = strings.TrimSpace(host)
-		// skip empty lines and comments
-		if host == "" || host[:1] == "#" {
-			continue
-		}
+		buf := bytes.NewBuffer(output)
+		for {
+			hostStr, err := buf.ReadString('\n')
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+				return nil, err
+			}
 
-		hosts = append(hosts, &Host{Address: host})
+			hostStr = strings.TrimSpace(hostStr)
+			// skip empty lines and comments
+			if hostStr == "" || hostStr[:1] == "#" {
+				continue
+			}
+
+			host, err := NewHost(hostStr)
+			if err != nil {
+				return nil, err
+			}
+			hosts = append(hosts, host)
+		}
 	}
+
 	return hosts, nil
 }
