@@ -1,0 +1,19 @@
+---
+all:
+  children:
+    #
+    # Multi-Server Group: Surfly Staging; surfly.online
+    #
+    online:
+      hosts:
+        stag-online-primary-neva:
+        stag-online-cobro-eude:
+        stag-online-cobro-eufi:
+    #
+    # Multi-Server Group: Surfly Development: surfly-dev1.com
+    #
+    stag_dev:
+      hosts:
+        stag-dev-primary-neva:
+        stag-dev-cobro-eufi:
+        stag-dev-backup:
