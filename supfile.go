@@ -480,9 +480,10 @@ func (n Network) ParseInventory() ([]*Host, error) {
 
 	// Handle Ansible inventory
 	if n.AnsibleInventory != "" {
-		ansibleHosts, err := ParseAnsibleInventory(n.AnsibleInventory, n.Env)
+		resolvedAnsibleInventoryPath := ResolvePath(n.AnsibleInventory)
+		ansibleHosts, err := ParseAnsibleInventory(resolvedAnsibleInventoryPath, n.Env)
 		if err != nil {
-			return nil, errors.Wrapf(err, "failed to parse ansible inventory: %s", n.AnsibleInventory)
+			return nil, errors.Wrapf(err, "failed to parse ansible inventory: %s (resolved: %s)", n.AnsibleInventory, resolvedAnsibleInventoryPath)
 		}
 		allHosts = append(allHosts, ansibleHosts...)
 	}
@@ -515,6 +516,9 @@ type AnsibleGroup struct {
 // ParseAnsibleInventory runs `ansible-inventory -i <inventoryPath> --list`
 // and parses its JSON output to extract a list of hosts.
 func ParseAnsibleInventory(inventoryPath string, env EnvList) ([]*Host, error) {
+	fmt.Printf("ParseAnsibleInventory: inventoryPath = %s\n", inventoryPath)
+	fmt.Printf("ParseAnsibleInventory: env = %v\n", env.Slice())
+
 	if inventoryPath == "" {
 		return nil, errors.New("ansible inventory path is empty")
 	}
@@ -524,17 +528,34 @@ func ParseAnsibleInventory(inventoryPath string, env EnvList) ([]*Host, error) {
 	cmd.Env = append(cmd.Env, env.Slice()...)
 
 	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
+	cmd.Stderr = &stderr // Capture stderr separately
 
-	output, err := cmd.Output()
+	fmt.Printf("ParseAnsibleInventory: Executing command: %s %v\n", cmd.Path, cmd.Args)
+	outputBytes, err := cmd.Output() // Use cmd.Output to get stdout
+
 	if err != nil {
+		// If cmd.Output() errors, stderr was captured in stderr.String()
+		// outputBytes might be empty or partial in this case.
+		fmt.Printf("ParseAnsibleInventory: Command execution error: %v\n", err)
+		fmt.Printf("ParseAnsibleInventory: Command stderr: %s\n", stderr.String())
+		// It's important to return here, as outputBytes might not be valid JSON
 		return nil, errors.Wrapf(err, "failed to execute ansible-inventory: %s", stderr.String())
 	}
+	// If no error, stdout is in outputBytes, and stderr (if any) was captured too (though usually empty on success)
+	fmt.Printf("ParseAnsibleInventory: Command stdout: %s\n", string(outputBytes))
+	if stderr.Len() > 0 {
+		fmt.Printf("ParseAnsibleInventory: Command stderr (on success): %s\n", stderr.String())
+	}
+
 
 	var inventoryData map[string]interface{}
-	if err := json.Unmarshal(output, &inventoryData); err != nil {
-		return nil, errors.Wrap(err, "failed to unmarshal ansible-inventory JSON output")
+	if errUnmarshal := json.Unmarshal(outputBytes, &inventoryData); errUnmarshal != nil {
+		fmt.Printf("ParseAnsibleInventory: JSON unmarshal error: %v\n", errUnmarshal)
+		fmt.Printf("ParseAnsibleInventory: Parsed JSON data (first 200 chars): %.200s\n", string(outputBytes))
+		return nil, errors.Wrap(errUnmarshal, "failed to unmarshal ansible-inventory JSON output")
 	}
+	fmt.Printf("ParseAnsibleInventory: Parsed JSON data (first 200 chars): %.200s\n", string(outputBytes))
+
 
 	allHostnames := make(map[string]struct{})
 
@@ -580,8 +601,8 @@ func ParseAnsibleInventory(inventoryPath string, env EnvList) ([]*Host, error) {
 			}
 			// Ensure groupDetails is a map before trying to access its "hosts" or "children"
 			if groupMap, ok := groupDetails.(map[string]interface{}); ok {
-				if hosts, ok := groupMap["hosts"].([]interface{}); ok {
-					for _, hostInterface := range hosts {
+				if hostsInGroup, ok := groupMap["hosts"].([]interface{}); ok { // Renamed to avoid conflict
+					for _, hostInterface := range hostsInGroup {
 						if hostStr, ok := hostInterface.(string); ok {
 							allHostnames[hostStr] = struct{}{}
 						}
@@ -598,17 +619,25 @@ func ParseAnsibleInventory(inventoryPath string, env EnvList) ([]*Host, error) {
 			}
 		}
 	}
+	fmt.Printf("ParseAnsibleInventory: Extracted hostnames map: %v\n", allHostnames)
 
 
-	var hosts []*Host
+	var hosts []*Host // Renamed to avoid conflict with 'hosts' in groupMap
 	for hostname := range allHostnames {
-		host, err := NewHost(hostname)
-		if err != nil {
+		host, errHost := NewHost(hostname) // Renamed err to avoid conflict
+		if errHost != nil {
 			// Log or collect errors for hosts that fail to parse?
 			// For now, let's skip them or return an error for the first one.
-			return nil, errors.Wrapf(err, "failed to create host object for '%s'", hostname)
+			// This error is already covered by a test case and will be returned.
+			return nil, errors.Wrapf(errHost, "failed to create host object for '%s'", hostname)
 		}
 		hosts = append(hosts, host)
+	}
+
+	fmt.Printf("ParseAnsibleInventory: Returning %d hosts:\n", len(hosts))
+	for _, h := range hosts {
+		fmt.Printf("ParseAnsibleInventory: Hostname: %s\n", h.GetHostname())
+		fmt.Printf("ParseAnsibleInventory: host object details: %+v\n", h)
 	}
 
 	return hosts, nil
