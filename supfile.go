@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"os/user"
 	"strings"
+	"encoding/json"
 
 	"github.com/pkg/errors"
 
@@ -26,11 +27,12 @@ type Supfile struct {
 
 // Network is group of hosts with extra custom env vars.
 type Network struct {
-	Env             EnvList  `yaml:"env"`
-	Inventory       string   `yaml:"inventory"`
-	Hosts           []*Host  `yaml:"-"`
-	HostsFromConfig []string `yaml:"hosts"`
-	Bastion         string   `yaml:"bastion"` // Jump host for the environment
+	Env              EnvList  `yaml:"env"`
+	Inventory        string   `yaml:"inventory"`
+	AnsibleInventory string   `yaml:"ansible_inventory,omitempty"`
+	Hosts            []*Host  `yaml:"-"`
+	HostsFromConfig  []string `yaml:"hosts"`
+	Bastion          string   `yaml:"bastion"` // Jump host for the environment
 }
 
 func (n *Network) UnmarshalYAML(unmarshal func(interface{}) error) error {
@@ -432,40 +434,182 @@ func NewSupfile(data []byte) (*Supfile, error) {
 	return &conf, nil
 }
 
-// ParseInventory runs the inventory command, if provided, and appends
-// the command's output lines to the manually defined list of hosts.
+// ParseInventory runs inventory commands/parsers and appends
+// their output lines to the manually defined list of hosts.
+// If both n.Inventory (shell command) and n.AnsibleInventory (Ansible file/script)
+// are defined, hosts from both sources will be merged.
 func (n Network) ParseInventory() ([]*Host, error) {
-	if n.Inventory == "" {
-		return nil, nil
+	var allHosts []*Host
+
+	// Handle traditional inventory script
+	if n.Inventory != "" {
+		cmd := exec.Command("/bin/sh", "-c", n.Inventory)
+		cmd.Env = os.Environ()
+		cmd.Env = append(cmd.Env, n.Env.Slice()...)
+		cmd.Stderr = os.Stderr
+		output, err := cmd.Output()
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to execute inventory command: %s", n.Inventory)
+		}
+
+		buf := bytes.NewBuffer(output)
+		for {
+			hostLine, err := buf.ReadString('\n')
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+				return nil, errors.Wrap(err, "failed to read inventory command output")
+			}
+
+			hostStr := strings.TrimSpace(hostLine)
+			// skip empty lines and comments
+			if hostStr == "" || (len(hostStr) > 0 && hostStr[0] == '#') {
+				continue
+			}
+
+			// Using NewHost to maintain consistency with how hosts are created elsewhere
+			host, err := NewHost(hostStr)
+			if err != nil {
+				// Potentially log this error or collect it if we want to be lenient
+				return nil, errors.Wrapf(err, "failed to parse host from inventory command: '%s'", hostStr)
+			}
+			allHosts = append(allHosts, host)
+		}
 	}
 
-	cmd := exec.Command("/bin/sh", "-c", n.Inventory)
+	// Handle Ansible inventory
+	if n.AnsibleInventory != "" {
+		ansibleHosts, err := ParseAnsibleInventory(n.AnsibleInventory, n.Env)
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to parse ansible inventory: %s", n.AnsibleInventory)
+		}
+		allHosts = append(allHosts, ansibleHosts...)
+	}
+
+	if len(allHosts) == 0 {
+		return nil, nil // No hosts found from any source
+	}
+
+	return allHosts, nil
+}
+
+// AnsibleInventoryData represents the structure of the `ansible-inventory --list` output.
+type AnsibleInventoryData struct {
+	Meta struct {
+		Hostvars map[string]interface{} `json:"hostvars"`
+	} `json:"_meta"`
+	All struct {
+		Children []string `json:"children"`
+	} `json:"all"`
+	Groups map[string]AnsibleGroup `json:"-"` // Populated dynamically
+}
+
+// AnsibleGroup represents a group in the Ansible inventory.
+type AnsibleGroup struct {
+	Hosts    []string `json:"hosts"`
+	Children []string `json:"children"`
+	Vars     map[string]interface{} `json:"vars"`
+}
+
+// ParseAnsibleInventory runs `ansible-inventory -i <inventoryPath> --list`
+// and parses its JSON output to extract a list of hosts.
+func ParseAnsibleInventory(inventoryPath string, env EnvList) ([]*Host, error) {
+	if inventoryPath == "" {
+		return nil, errors.New("ansible inventory path is empty")
+	}
+
+	cmd := exec.Command("ansible-inventory", "-i", inventoryPath, "--list")
 	cmd.Env = os.Environ()
-	cmd.Env = append(cmd.Env, n.Env.Slice()...)
-	cmd.Stderr = os.Stderr
+	cmd.Env = append(cmd.Env, env.Slice()...)
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
 	output, err := cmd.Output()
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrapf(err, "failed to execute ansible-inventory: %s", stderr.String())
 	}
+
+	var inventoryData map[string]interface{}
+	if err := json.Unmarshal(output, &inventoryData); err != nil {
+		return nil, errors.Wrap(err, "failed to unmarshal ansible-inventory JSON output")
+	}
+
+	allHostnames := make(map[string]struct{})
+
+	// extractHosts recursively extracts hostnames from the inventory structure.
+	var extractHosts func(groupName string, groups map[string]interface{})
+	extractHosts = func(groupName string, groups map[string]interface{}) {
+		groupData, ok := groups[groupName]
+		if !ok {
+			return
+		}
+
+		groupMap, ok := groupData.(map[string]interface{})
+		if !ok {
+			return
+		}
+
+		if hosts, ok := groupMap["hosts"].([]interface{}); ok {
+			for _, hostInterface := range hosts {
+				if hostStr, ok := hostInterface.(string); ok {
+					allHostnames[hostStr] = struct{}{}
+				}
+			}
+		}
+
+		if children, ok := groupMap["children"].([]interface{}); ok {
+			for _, childInterface := range children {
+				if childStr, ok := childInterface.(string); ok {
+					extractHosts(childStr, groups)
+				}
+			}
+		}
+	}
+
+	// Start extraction from the "all" group if it exists, or iterate through top-level groups.
+	if _, ok := inventoryData["all"]; ok {
+		extractHosts("all", inventoryData)
+	} else {
+		// If "all" group is not present (older ansible versions or specific inventory structures)
+		// iterate over all top-level groups except "_meta"
+		for groupName, groupDetails := range inventoryData {
+			if groupName == "_meta" {
+				continue
+			}
+			// Ensure groupDetails is a map before trying to access its "hosts" or "children"
+			if groupMap, ok := groupDetails.(map[string]interface{}); ok {
+				if hosts, ok := groupMap["hosts"].([]interface{}); ok {
+					for _, hostInterface := range hosts {
+						if hostStr, ok := hostInterface.(string); ok {
+							allHostnames[hostStr] = struct{}{}
+						}
+					}
+				}
+				if children, ok := groupMap["children"].([]interface{}); ok {
+					for _, childInterface := range children {
+						if childStr, ok := childInterface.(string); ok {
+							// Pass the main inventoryData map for recursive calls
+							extractHosts(childStr, inventoryData)
+						}
+					}
+				}
+			}
+		}
+	}
+
 
 	var hosts []*Host
-	buf := bytes.NewBuffer(output)
-	for {
-		host, err := buf.ReadString('\n')
+	for hostname := range allHostnames {
+		host, err := NewHost(hostname)
 		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return nil, err
+			// Log or collect errors for hosts that fail to parse?
+			// For now, let's skip them or return an error for the first one.
+			return nil, errors.Wrapf(err, "failed to create host object for '%s'", hostname)
 		}
-
-		host = strings.TrimSpace(host)
-		// skip empty lines and comments
-		if host == "" || host[:1] == "#" {
-			continue
-		}
-
-		hosts = append(hosts, &Host{Address: host})
+		hosts = append(hosts, host)
 	}
+
 	return hosts, nil
 }

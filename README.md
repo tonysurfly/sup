@@ -54,6 +54,50 @@ networks:
     staging:
         # fetch dynamic list of hosts
         inventory: curl http://example.com/latest/meta-data/hostname
+
+### Ansible Inventory
+
+Sup can also use an Ansible inventory file or script to discover hosts. This is useful if you already have your infrastructure defined in Ansible.
+
+```yaml
+# Supfile excerpt
+networks:
+  dev:
+    # ...
+  ansible-net:
+    env:
+      # These env vars will be available to the ansible-inventory command
+      ANSIBLE_EXAMPLE_VAR: "hello_from_supfile"
+    # Path to your Ansible inventory file or dynamic inventory script
+    ansible_inventory: ./example/inventory.ansible.yml
+```
+
+When `ansible_inventory` is specified:
+1. Sup will execute `ansible-inventory -i <path_to_inventory> --list`.
+2. The JSON output from this command is parsed to extract all hostnames.
+3. The `ansible-inventory` command **must be available in the system's PATH** where `sup` is executed.
+4. Environment variables defined in the `Supfile` (both global `env` and network-specific `env` for `ansible-net`) will be passed to the `ansible-inventory` command. This allows you to configure Ansible behavior (e.g., by setting `ANSIBLE_VAULT_PASSWORD_FILE` or other Ansible environment variables).
+5. If both `inventory` (the traditional shell command) and `ansible_inventory` are defined for the same network, hosts from both sources will be merged.
+
+Here's an example of a compatible Ansible inventory file (`./example/inventory.ansible.yml`):
+```yaml
+# example/inventory.ansible.yml
+all:
+  children:
+    webservers:
+      hosts:
+        web1.example.com:
+        web2.example.com:
+          ansible_host: 192.168.1.102
+    dbservers:
+      hosts:
+        db1.example.com:
+  vars:
+    common_var: "this is common to all"
+ungrouped:
+  hosts:
+    utility1.example.com:
+    192.168.3.3:
 ```
 
 `$ sup production COMMAND` will run COMMAND on `api1`, `api2` and `api3` hosts in parallel.
