@@ -444,42 +444,77 @@ func NewSupfile(data []byte) (*Supfile, error) {
 // ParseInventory runs the inventory command or parses inventory file, if provided,
 // and appends the command's output lines to the manually defined list of hosts.
 func (n *Network) ParseInventory() ([]*Host, error) {
-	var hosts []*Host
+	var parsedHosts []*Host
+	processedHosts := make(map[string]struct{}) // To track added hosts and ensure uniqueness
+
+	addHost := func(hostData *aini.Host) error { // Changed to take *aini.Host
+		if hostData == nil { // Guard against nil pointer
+			return nil
+		}
+		if _, exists := processedHosts[hostData.Name]; exists {
+			return nil // Host already processed
+		}
+
+		host, err := NewHost(hostData.Name)
+		if err != nil {
+			return errors.Wrapf(err, "failed to parse host %s", hostData.Name) // Corrected error return
+		}
+
+		if user, ok := hostData.Vars["ansible_user"]; ok {
+			host.User = user
+		}
+		if portVal, ok := hostData.Vars["ansible_port"]; ok {
+			host.Port = portVal
+		} else if hostData.Port != 0 {
+			host.Port = fmt.Sprintf("%d", hostData.Port)
+		}
+
+		parsedHosts = append(parsedHosts, host)
+		processedHosts[hostData.Name] = struct{}{}
+		return nil
+	}
+
+	// processGroup recursively processes a group and its children/hosts
+	var processGroup func(group *aini.Group) error // Changed to *aini.Group
+	processGroup = func(group *aini.Group) error {
+		if group == nil {
+			return nil
+		}
+		for _, childGroup := range group.Children { // childGroup is *aini.Group
+			if err := processGroup(childGroup); err != nil {
+				return errors.Wrapf(err, "failed processing child group of %s", group.Name) // Corrected error return
+			}
+		}
+		for _, hostData := range group.Hosts { // hostData is *aini.Host
+			if err := addHost(hostData); err != nil {
+				// Log error or decide if one bad host should stop all parsing
+				return errors.Wrapf(err, "failed to process host %s in group %s", hostData.Name, group.Name) // Corrected error return
+			}
+		}
+		return nil
+	}
 
 	if n.InventoryFile != "" {
 		inventory, err := aini.ParseFile(n.InventoryFile)
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to parse inventory file")
 		}
-		for _, hostData := range inventory.Hosts {
-			host, err := NewHost(hostData.Name)
-			if err != nil {
-				// TODO: consider whether to skip invalid hosts or return error
-				return nil, errors.Wrapf(err, "failed to parse host %s", hostData.Name)
-			}
-			// User is overridden if ansible_user is in hostData.Vars.
-			// This ensures host-specific ansible_user takes precedence over user in host string or default from NewHost.
-			if user, ok := hostData.Vars["ansible_user"]; ok {
-				host.User = user
-			}
 
-			// Port resolution:
-			// NewHost sets a default port ("22") or parses it if hostData.Name (e.g. ansible_host) contains "name:port".
-			// It also might get a port from SSH config.
-			// The following logic ensures ansible inventory ports take precedence.
-			if portVal, ok := hostData.Vars["ansible_port"]; ok {
-				// ansible_port from host variables (host > group > all) takes highest precedence after NewHost.
-				host.Port = portVal
-			} else if hostData.Port != 0 {
-				// If aini.HostData.Port is set (e.g. from "host:port" syntax in inventory, not captured as a var)
-				// and ansible_port was not in Vars, use this.
-				host.Port = fmt.Sprintf("%d", hostData.Port)
+		// Process top-level hosts first (hosts not under any specific group in INI, or default group in YAML)
+		for _, hostData := range inventory.Hosts { // hostData is *aini.Host
+			if err := addHost(hostData); err != nil {
+				return nil, errors.Wrapf(err, "failed to process top-level host %s", hostData.Name)
 			}
-			// If neither of the above, host.Port remains what NewHost determined (default, name:port, or ssh config).
+		}
 
-			hosts = append(hosts, host)
+		// Process hosts within groups
+		for _, group := range inventory.Groups { // group is *aini.Group
+			if err := processGroup(group); err != nil {
+				return nil, err // Error already wrapped by processGroup or addHost
+			}
 		}
 	} else if n.Inventory != "" {
+		// This part remains for handling inventory via command
 		cmd := exec.Command("/bin/sh", "-c", n.Inventory)
 		cmd.Env = os.Environ()
 		cmd.Env = append(cmd.Env, n.Env.Slice()...)
@@ -509,9 +544,15 @@ func (n *Network) ParseInventory() ([]*Host, error) {
 			if err != nil {
 				return nil, err
 			}
-			hosts = append(hosts, host)
+			// Ensure uniqueness for hosts from command too, though less likely to have duplicates here
+			if _, exists := processedHosts[host.Address]; !exists {
+				parsedHosts = append(parsedHosts, host)
+				processedHosts[host.Address] = struct{}{}
+			} else {
+				// Potentially log that a duplicate from command output was ignored if needed
+			}
 		}
 	}
 
-	return hosts, nil
+	return parsedHosts, nil
 }

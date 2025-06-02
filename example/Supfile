@@ -47,6 +47,21 @@ networks:
     # env:
     #   MY_VAR: my_value
 
+  ansible_yaml_example:
+    # Example of using a complex Ansible YAML inventory file.
+    inventoryfile: example/ansible_inventory_complex.yml
+    # NOTE: As of sup's integration with aini v1.6.0, parsing complex YAML
+    # inventories like 'ansible_inventory_complex.yml' (especially those
+    # with missing 'ansible_port' or potentially other nested/empty structures)
+    # may fail.
+    # The underlying aini.ParseFile function has been observed to return an error like:
+    # "failed to parse inventory file: strconv.Atoi: parsing \"\": invalid syntax"
+    # This indicates an issue within aini's YAML processing.
+    # Simpler YAML structures or YAML files where all hosts have all variables
+    # explicitly defined might work, but this complex example currently does not.
+    # env:
+    #   SOME_VAR: for_yaml_hosts
+
 commands:
   # Named set of commands to be run remotely
   ping:

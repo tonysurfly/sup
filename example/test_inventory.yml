@@ -1,0 +1,19 @@
+all:
+  children:
+    prod:
+      hosts:
+        prod-primary-eude:
+          ansible_user: yamluser1
+          ansible_port: 2201
+        prod-backup-eude:
+          ansible_port: 22 # Explicitly add default port
+    socks:
+      hosts:
+        prod-socks-eunl-1:
+          ansible_user: sockuser
+          ansible_port: 22 # Explicitly add default port
+  vars: # Group vars for 'all'
+    ansible_user: default_yaml_user
+# Top-level host not in any group
+toplevelhost.example.com:
+  ansible_port: 2205

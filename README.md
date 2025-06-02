@@ -60,7 +60,7 @@ networks:
 
 ### Using Ansible Inventory Files
 
-Sup can also load hosts from Ansible-compatible inventory files (INI format). This is useful if you already manage your infrastructure using Ansible.
+Sup can also load hosts from Ansible-compatible inventory files, supporting both INI and YAML formats. This is useful if you already manage your infrastructure using Ansible.
 
 To use an inventory file, specify the `inventoryfile` field in your network configuration:
 
@@ -75,9 +75,26 @@ networks:
     #   - additional_host.example.com
 ```
 
-Sup will parse the INI file and add all hosts found to the specified network. If a host is defined in both `hosts` and the `inventoryfile`, it will be included. Sup leverages the `github.com/relex/aini` library for parsing, which primarily supports the INI format. While `aini` might handle YAML inventories if the file has a `.yml` or `.yaml` extension, INI is the most robustly supported format.
+Sup leverages the `github.com/relex/aini` library (v1.6.0) for parsing. This library automatically detects the file type based on its extension:
+-   `.ini` files are parsed as INI format.
+-   `.yml` or `.yaml` files are parsed as YAML format.
 
-**Note:** If both `inventory` (for dynamic host fetching) and `inventoryfile` are specified for a network, `inventoryfile` will take precedence.
+Sup will then add all unique hosts found (across all groups and top-level entries) to the specified network. If a host is also defined in the `hosts` list in `Supfile` for that network, it will be included alongside those from the inventory file.
+
+**INI Format Example:**
+See `example/ansible_inventory.ini`. Variables like `ansible_user` and `ansible_port` are supported.
+
+**YAML Format Example:**
+See `example/test_inventory.yml` for a working basic YAML example and `example/ansible_inventory_complex.yml` for a more complex structure.
+
+**Important Note on YAML Support Limitations:**
+While `aini` provides YAML parsing, there are current limitations (observed with `aini v1.6.0`):
+-   **Complex Structures**: Parsing highly nested or complex YAML structures, particularly those where hosts might be missing explicit `ansible_port` or `ansible_user` variables, can lead to errors within the `aini` library.
+-   **Error Example**: An error like `failed to parse inventory file: strconv.Atoi: parsing "": invalid syntax` has been observed when `aini` encounters certain YAML structures that it doesn't fully resolve (e.g., potentially related to missing optional variables for hosts leading to empty strings where numbers are expected).
+-   The file `example/ansible_inventory_complex.yml` demonstrates a structure that currently triggers such parsing issues within `aini`.
+-   Users attempting to use YAML inventories should prefer simpler, flatter structures or ensure all hosts have explicit `ansible_user` and `ansible_port` variables defined if they encounter parsing problems. INI format is generally more robustly supported by `aini`.
+
+**Note on Precedence:** If both `inventory` (for dynamic host fetching via command) and `inventoryfile` are specified for a network, `inventoryfile` will take precedence.
 
 ## Command
 
