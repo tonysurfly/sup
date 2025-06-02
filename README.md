@@ -54,57 +54,26 @@ networks:
     staging:
         # fetch dynamic list of hosts
         inventory: curl http://example.com/latest/meta-data/hostname
-    ansible-net:
-        # use Ansible inventory file
-        ansible_inventory: path/to/inventory.yml
 ```
 
 `$ sup production COMMAND` will run COMMAND on `api1`, `api2` and `api3` hosts in parallel.
 
 ### Ansible Inventory
 
-Sup supports using Ansible inventory files to define networks. This allows you to reuse your existing Ansible infrastructure definitions.
+Sup supports using Ansible inventory files to define networks, enabling you to reuse your existing Ansible infrastructure definitions.
 
 ```yaml
 networks:
   webservers:
-    ansible_inventory: path/to/inventory.yml
+    ansible_inventory: path/to/inventory.yml  # Path to your Ansible inventory file
+    ansible_group: webservers                  # Required - specific Ansible group to use
 ```
 
-Sup will run `ansible-inventory -i path/to/inventory.yml --list` and parse the JSON output to extract hosts. It will automatically handle Ansible groups and use the `ansible_host` variable if defined in the inventory.
+When you run a command with an Ansible-defined network, Sup will:
 
-Example JSON output from Ansible inventory:
-
-```json
-{
-    "_meta": {
-        "hostvars": {
-            "192.168.3.3": {
-                "common_var": "this is common to all"
-            },
-            "web2.example.com": {
-                "ansible_host": "192.168.1.102",
-                "common_var": "this is common to all"
-            }
-        }
-    },
-    "all": {
-        "children": [
-            "ungrouped",
-            "webservers",
-            "dbservers"
-        ]
-    },
-    "webservers": {
-        "hosts": [
-            "web1.example.com",
-            "web2.example.com"
-        ]
-    }
-}
-```
-
-Sup will extract all hosts from all groups and use the `ansible_host` value when available.
+1. Execute `ansible-inventory -i path/to/inventory.yml --list` to get the JSON inventory
+2. Extract hosts from the specified `ansible_group`
+3. Create connections to each host in the group in parallel
 
 ## Command
 
