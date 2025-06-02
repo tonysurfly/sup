@@ -9,9 +9,13 @@ import (
 	"os/exec"
 	"os/user"
 	"strings"
+	"io/ioutil"
+	"path/filepath"
+	"strconv"
+
 
 	"github.com/pkg/errors"
-	"github.com/relex/aini"
+
 	"gopkg.in/yaml.v2"
 )
 
@@ -26,35 +30,160 @@ type Supfile struct {
 
 // Network is group of hosts with extra custom env vars.
 type Network struct {
-	Env             EnvList  `yaml:"env"`
-	Inventory       string   `yaml:"inventory"`
-	InventoryFile   string   `yaml:"inventoryfile"`
-	Hosts           []*Host  `yaml:"-"`
-	HostsFromConfig []string `yaml:"hosts"`
-	Bastion         string   `yaml:"bastion"` // Jump host for the environment
+	Env                  EnvList  `yaml:"env"`
+	Inventory            string   `yaml:"inventory"`
+	AnsibleInventoryFile string   `yaml:"ansible_inventory_file,omitempty"` // New field
+	Hosts                []*Host  `yaml:"-"`
+	HostsFromConfig      []string `yaml:"hosts"`
+	Bastion              string   `yaml:"bastion"` // Jump host for the environment
 }
 
 func (n *Network) UnmarshalYAML(unmarshal func(interface{}) error) error {
-	type Alias Network // Use alias to avoid recursion
-	aux := &struct {
-		InventoryFile string `yaml:"inventoryfile"`
-		*Alias
-	}{
-		Alias: (*Alias)(n),
-	}
-	if err := unmarshal(aux); err != nil {
+	type NewNetwork Network // Use a type alias to avoid recursion
+	if err := unmarshal((*NewNetwork)(n)); err != nil {
 		return err
 	}
-	n.InventoryFile = aux.InventoryFile
 
-	for _, item := range n.HostsFromConfig {
-		host, err := NewHost(item)
+	if n.AnsibleInventoryFile != "" {
+		// ResolvePath is assumed to be available in the package, like in NewHost
+		absPath, err := filepath.Abs(ResolvePath(n.AnsibleInventoryFile))
 		if err != nil {
-			return err
+			return errors.Wrapf(err, "failed to get absolute path for ansible inventory file: %s", n.AnsibleInventoryFile)
 		}
-		n.Hosts = append(n.Hosts, host)
+
+		ansibleHosts, err := parseAnsibleInventoryFile(absPath)
+		if err != nil {
+			// If Ansible inventory parsing fails, we might want to fall back or just error out.
+			// For now, let's error out as per instruction "If AnsibleInventoryFile is specified and the file is successfully parsed, its hosts should be used."
+			return errors.Wrapf(err, "failed to parse ansible inventory file: %s", n.AnsibleInventoryFile)
+		}
+
+		// If successful, these hosts take precedence.
+		n.Hosts = ansibleHosts
+		n.HostsFromConfig = nil // Clear any hosts from HostsFromConfig
+		n.Inventory = ""      // Clear inventory command to prevent it from running
+	} else {
+		// Existing logic for HostsFromConfig if AnsibleInventoryFile is not provided
+		for _, item := range n.HostsFromConfig {
+			host, err := NewHost(item)
+			if err != nil {
+				return err
+			}
+			n.Hosts = append(n.Hosts, host)
+		}
 	}
 	return nil
+}
+
+// parseAnsibleInventoryFile reads and parses an Ansible YAML inventory file.
+func parseAnsibleInventoryFile(filePath string) ([]*Host, error) {
+	data, err := ioutil.ReadFile(filePath)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to read ansible inventory file: %s", filePath)
+	}
+
+	var inventoryData AnsibleInventoryData
+	if err := yaml.Unmarshal(data, &inventoryData); err != nil {
+		return nil, errors.Wrapf(err, "failed to unmarshal ansible inventory YAML from file: %s", filePath)
+	}
+
+	// Using a map to ensure host uniqueness based on user@address:port or similar identifier.
+	// NewHost and subsequent modifications will populate the Host struct.
+	// The key for extractedHosts will be host.GetHost() after potential modifications.
+	extractedHosts := make(map[string]*Host)
+
+	for groupName, groupData := range inventoryData {
+		if groupData != nil {
+			extractHostsFromAnsibleGroup(groupName, groupData, extractedHosts)
+		}
+	}
+
+	// Convert map to slice
+	hostsList := make([]*Host, 0, len(extractedHosts))
+	for _, host := range extractedHosts {
+		hostsList = append(hostsList, host)
+	}
+
+	return hostsList, nil
+}
+
+// extractHostsFromAnsibleGroup recursively extracts hosts from an Ansible group
+// and its children.
+func extractHostsFromAnsibleGroup(groupName string, groupData *AnsibleGroup, extractedHosts map[string]*Host) {
+	// Extract hosts from the current group
+	if groupData.Hosts != nil {
+		for hostKey, hostEntry := range groupData.Hosts {
+			var address string
+			var user string
+			var port int
+
+			// Determine the primary address for NewHost
+			if hostEntry != nil && hostEntry.AnsibleHost != "" {
+				address = hostEntry.AnsibleHost
+			} else {
+				address = hostKey // Use the map key (alias) as address if ansible_host is not set
+			}
+
+			// If hostEntry has user/port, prepare them
+			if hostEntry != nil {
+				if hostEntry.AnsibleUser != "" {
+					user = hostEntry.AnsibleUser
+				}
+				if hostEntry.AnsiblePort > 0 {
+					port = hostEntry.AnsiblePort
+				}
+			}
+
+			// Create host string for NewHost, can be complex if user or port needs to be pre-set.
+			// NewHost can parse "user@host:port", but it's safer to set fields after.
+			// Let NewHost handle default user and port, then override.
+			host, err := NewHost(address)
+			if err != nil {
+				// Log or handle error, e.g., by skipping this host
+				fmt.Fprintf(os.Stderr, "Warning: skipping host '%s' from ansible inventory group '%s' due to error in NewHost(%s): %v\n", hostKey, groupName, address, err)
+				continue
+			}
+
+			// Override user if specified in inventory
+			if user != "" {
+				host.User = user
+			}
+
+			// Override port if specified in inventory
+			if port > 0 {
+				host.Port = strconv.Itoa(port)
+			}
+
+			// If ansible_host was used as the address and it's different from the hostKey (alias), set KnownAs.
+			// NewHost might also set KnownAs from SSH config. This explicit KnownAs from inventory alias should be considered.
+			// If host.Address (after NewHost potentially resolves it via SSH config) is different from hostKey,
+			// and host.KnownAs is not already set to hostKey by NewHost, then set it.
+			if hostEntry != nil && hostEntry.AnsibleHost != "" && hostKey != hostEntry.AnsibleHost {
+				host.KnownAs = hostKey
+			} else if hostEntry == nil && hostKey != host.Address && host.KnownAs == "" {
+				// If it's a simple host entry (e.g., "myhost:") and NewHost resolved "myhost" to a different IP,
+				// set KnownAs to "myhost".
+				host.KnownAs = hostKey
+			}
+
+
+			// Add/replace host in the map to ensure uniqueness and that variables are applied.
+			// Keying by GetHost() which is address:port. If user changes, it's still the same target machine.
+			// If multiple ansible entries point to the same machine but with different effective users/ports due to vars,
+			// the last one processed would win if keyed simply by address:port.
+			// For now, address:port is the uniqueness constraint from GetHost().
+			extractedHosts[host.GetHost()] = host
+		}
+	}
+
+	// Recursively process children
+	if groupData.Children != nil {
+		for childGroupName, childGroupData := range groupData.Children {
+			if childGroupData != nil {
+				extractHostsFromAnsibleGroup(childGroupName, childGroupData, extractedHosts)
+			}
+		}
+	}
 }
 
 // Host describes how to connect to a host
@@ -86,7 +215,15 @@ func (h *Host) GetPrefixText() string {
 	if h.KnownAs != "" {
 		prefix = h.KnownAs
 	} else {
-		prefix = fmt.Sprintf("%s@%s:%s", h.User, h.Address, h.Port)
+		// Use h.GetHostname() for prefix to prefer KnownAs if available through other means too.
+		prefixHostname := h.GetHostname()
+		if strings.Contains(prefixHostname, ":") { // if GetHostname somehow returns host:port
+			prefixHostname = h.Address // fallback to just address if GetHostname is complex
+		}
+		if len(prefixHostname) > 25 { // Keep prefix from being too long
+			prefixHostname = prefixHostname[:22] + "..."
+		}
+		prefix = fmt.Sprintf("%s@%s:%s", h.User, prefixHostname, h.Port)
 	}
 	return fmt.Sprintf("%s | ", prefix)
 }
@@ -376,6 +513,26 @@ func (e ErrUnsupportedSupfileVersion) Error() string {
 	return fmt.Sprintf("%v\n\nCheck your Supfile version (available latest version: v0.5)", e.Msg)
 }
 
+// AnsibleHostEntry represents a host entry in the Ansible inventory.
+// It can be a simple string or a map with variables.
+type AnsibleHostEntry struct {
+	AnsibleHost string                 `yaml:"ansible_host,omitempty"`
+	AnsibleUser string                 `yaml:"ansible_user,omitempty"`
+	AnsiblePort int                    `yaml:"ansible_port,omitempty"`
+	Vars        map[string]interface{} `yaml:",inline"` // For other arbitrary vars
+}
+
+// AnsibleGroup represents a group in the Ansible inventory.
+type AnsibleGroup struct {
+	Hosts    map[string]*AnsibleHostEntry `yaml:"hosts,omitempty"`
+	Vars     map[string]interface{}       `yaml:"vars,omitempty"`
+	Children map[string]*AnsibleGroup     `yaml:"children,omitempty"`
+}
+
+// AnsibleInventoryData is the top-level structure for Ansible inventory.
+// It's a map of group names to AnsibleGroup structs.
+type AnsibleInventoryData map[string]*AnsibleGroup
+
 // NewSupfile parses configuration file and returns Supfile or error.
 func NewSupfile(data []byte) (*Supfile, error) {
 	var conf Supfile
@@ -432,7 +589,7 @@ func NewSupfile(data []byte) (*Supfile, error) {
 
 		fallthrough
 
-	case "0.4", "0.5", "0.6":
+	case "0.4", "0.5":
 
 	default:
 		return nil, ErrUnsupportedSupfileVersion{"unsupported Supfile version " + conf.Version}
@@ -441,118 +598,46 @@ func NewSupfile(data []byte) (*Supfile, error) {
 	return &conf, nil
 }
 
-// ParseInventory runs the inventory command or parses inventory file, if provided,
-// and appends the command's output lines to the manually defined list of hosts.
-func (n *Network) ParseInventory() ([]*Host, error) {
-	var parsedHosts []*Host
-	processedHosts := make(map[string]struct{}) // To track added hosts and ensure uniqueness
-
-	addHost := func(hostData *aini.Host) error { // Changed to take *aini.Host
-		if hostData == nil { // Guard against nil pointer
-			return nil
-		}
-		if _, exists := processedHosts[hostData.Name]; exists {
-			return nil // Host already processed
-		}
-
-		host, err := NewHost(hostData.Name)
-		if err != nil {
-			return errors.Wrapf(err, "failed to parse host %s", hostData.Name) // Corrected error return
-		}
-
-		if user, ok := hostData.Vars["ansible_user"]; ok {
-			host.User = user
-		}
-		if portVal, ok := hostData.Vars["ansible_port"]; ok {
-			host.Port = portVal
-		} else if hostData.Port != 0 {
-			host.Port = fmt.Sprintf("%d", hostData.Port)
-		}
-
-		parsedHosts = append(parsedHosts, host)
-		processedHosts[hostData.Name] = struct{}{}
-		return nil
+// ParseInventory runs the inventory command, if provided, and appends
+// the command's output lines to the manually defined list of hosts.
+// This should NOT be called if hosts were successfully loaded from AnsibleInventoryFile.
+func (n Network) ParseInventory() ([]*Host, error) {
+	if n.Inventory == "" { // Check if inventory command is cleared or not set
+		return nil, nil
 	}
 
-	// processGroup recursively processes a group and its children/hosts
-	var processGroup func(group *aini.Group) error // Changed to *aini.Group
-	processGroup = func(group *aini.Group) error {
-		if group == nil {
-			return nil
-		}
-		for _, childGroup := range group.Children { // childGroup is *aini.Group
-			if err := processGroup(childGroup); err != nil {
-				return errors.Wrapf(err, "failed processing child group of %s", group.Name) // Corrected error return
-			}
-		}
-		for _, hostData := range group.Hosts { // hostData is *aini.Host
-			if err := addHost(hostData); err != nil {
-				// Log error or decide if one bad host should stop all parsing
-				return errors.Wrapf(err, "failed to process host %s in group %s", hostData.Name, group.Name) // Corrected error return
-			}
-		}
-		return nil
+	// If n.Hosts is already populated (e.g. by Ansible inventory), this function might
+	// append to them or replace them, depending on how it's called by sup.go.
+	// The modification in UnmarshalYAML to clear n.Inventory aims to prevent this.
+	fmt.Fprintln(os.Stderr, "Warning: Executing command-based inventory. This should not happen if Ansible inventory was used and configured to be authoritative.")
+
+	cmd := exec.Command("/bin/sh", "-c", n.Inventory)
+	cmd.Env = os.Environ()
+	cmd.Env = append(cmd.Env, n.Env.Slice()...)
+	cmd.Stderr = os.Stderr
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, err
 	}
 
-	if n.InventoryFile != "" {
-		inventory, err := aini.ParseFile(n.InventoryFile)
+	var hosts []*Host
+	buf := bytes.NewBuffer(output)
+	for {
+		host, err := buf.ReadString('\n')
 		if err != nil {
-			return nil, errors.Wrap(err, "failed to parse inventory file")
-		}
-
-		// Process top-level hosts first (hosts not under any specific group in INI, or default group in YAML)
-		for _, hostData := range inventory.Hosts { // hostData is *aini.Host
-			if err := addHost(hostData); err != nil {
-				return nil, errors.Wrapf(err, "failed to process top-level host %s", hostData.Name)
+			if err == io.EOF {
+				break
 			}
-		}
-
-		// Process hosts within groups
-		for _, group := range inventory.Groups { // group is *aini.Group
-			if err := processGroup(group); err != nil {
-				return nil, err // Error already wrapped by processGroup or addHost
-			}
-		}
-	} else if n.Inventory != "" {
-		// This part remains for handling inventory via command
-		cmd := exec.Command("/bin/sh", "-c", n.Inventory)
-		cmd.Env = os.Environ()
-		cmd.Env = append(cmd.Env, n.Env.Slice()...)
-		cmd.Stderr = os.Stderr
-		output, err := cmd.Output()
-		if err != nil {
 			return nil, err
 		}
 
-		buf := bytes.NewBuffer(output)
-		for {
-			hostStr, err := buf.ReadString('\n')
-			if err != nil {
-				if err == io.EOF {
-					break
-				}
-				return nil, err
-			}
-
-			hostStr = strings.TrimSpace(hostStr)
-			// skip empty lines and comments
-			if hostStr == "" || hostStr[:1] == "#" {
-				continue
-			}
-
-			host, err := NewHost(hostStr)
-			if err != nil {
-				return nil, err
-			}
-			// Ensure uniqueness for hosts from command too, though less likely to have duplicates here
-			if _, exists := processedHosts[host.Address]; !exists {
-				parsedHosts = append(parsedHosts, host)
-				processedHosts[host.Address] = struct{}{}
-			} else {
-				// Potentially log that a duplicate from command output was ignored if needed
-			}
+		host = strings.TrimSpace(host)
+		// skip empty lines and comments
+		if host == "" || host[:1] == "#" {
+			continue
 		}
-	}
 
-	return parsedHosts, nil
+		hosts = append(hosts, &Host{Address: host})
+	}
+	return hosts, nil
 }

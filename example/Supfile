@@ -16,8 +16,6 @@ networks:
   local:
     hosts:
       - localhost
-    # Alternatively, load hosts from an Ansible-style inventory file:
-    # inventoryfile: /path/to/your/local_inventory.ini
 
   dev:
     env:
@@ -35,32 +33,6 @@ networks:
   
   k8s:
     inventory: for i in $(kubectl get nodes -o jsonpath={.items[*].status.addresses[?\(@.type==\"InternalIP\"\)].address}); do echo "ubuntu@$i"; done
-
-  ansible_hosts:
-    # Example of using an Ansible inventory file.
-    # The hosts from this file will be loaded.
-    # User and port can be specified in the inventory file per host
-    # (e.g., web1.example.com ansible_user=alice ansible_port=2222)
-    # or globally/per-group using [all:vars] or [group:vars].
-    inventoryfile: example/ansible_inventory.ini
-    # You can also add other network-specific env vars here if needed:
-    # env:
-    #   MY_VAR: my_value
-
-  ansible_yaml_example:
-    # Example of using a complex Ansible YAML inventory file.
-    inventoryfile: example/ansible_inventory_complex.yml
-    # NOTE: As of sup's integration with aini v1.6.0, parsing complex YAML
-    # inventories like 'ansible_inventory_complex.yml' (especially those
-    # with missing 'ansible_port' or potentially other nested/empty structures)
-    # may fail.
-    # The underlying aini.ParseFile function has been observed to return an error like:
-    # "failed to parse inventory file: strconv.Atoi: parsing \"\": invalid syntax"
-    # This indicates an issue within aini's YAML processing.
-    # Simpler YAML structures or YAML files where all hosts have all variables
-    # explicitly defined might work, but this complex example currently does not.
-    # env:
-    #   SOME_VAR: for_yaml_hosts
 
 commands:
   # Named set of commands to be run remotely
