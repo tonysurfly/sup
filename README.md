@@ -58,6 +58,23 @@ networks:
 
 `$ sup production COMMAND` will run COMMAND on `api1`, `api2` and `api3` hosts in parallel.
 
+### Ansible Inventory
+
+Sup supports using Ansible inventory files to define networks, enabling you to reuse your existing Ansible infrastructure definitions.
+
+```yaml
+networks:
+  webservers:
+    ansible_inventory: path/to/inventory.yml  # Path to your Ansible inventory file
+    ansible_group: webservers                  # Required - specific Ansible group to use
+```
+
+When you run a command with an Ansible-defined network, Sup will:
+
+1. Execute `ansible-inventory -i path/to/inventory.yml --list` to get the JSON inventory
+2. Extract hosts from the specified `ansible_group`
+3. Create connections to each host in the group in parallel
+
 ## Command
 
 A shell command(s) to be run remotely.

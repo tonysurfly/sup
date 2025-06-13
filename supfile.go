@@ -26,11 +26,13 @@ type Supfile struct {
 
 // Network is group of hosts with extra custom env vars.
 type Network struct {
-	Env             EnvList  `yaml:"env"`
-	Inventory       string   `yaml:"inventory"`
-	Hosts           []*Host  `yaml:"-"`
-	HostsFromConfig []string `yaml:"hosts"`
-	Bastion         string   `yaml:"bastion"` // Jump host for the environment
+	Env              EnvList  `yaml:"env"`
+	Inventory        string   `yaml:"inventory"`
+	AnsibleInventory string   `yaml:"ansible_inventory"`
+	AnsibleGroup     string   `yaml:"ansible_group"`
+	Hosts            []*Host  `yaml:"-"`
+	HostsFromConfig  []string `yaml:"hosts"`
+	Bastion          string   `yaml:"bastion"` // Jump host for the environment
 }
 
 func (n *Network) UnmarshalYAML(unmarshal func(interface{}) error) error {
@@ -435,6 +437,10 @@ func NewSupfile(data []byte) (*Supfile, error) {
 // ParseInventory runs the inventory command, if provided, and appends
 // the command's output lines to the manually defined list of hosts.
 func (n Network) ParseInventory() ([]*Host, error) {
+	if n.AnsibleInventory != "" && n.AnsibleGroup != "" {
+		return n.parseAnsibleInventory()
+	}
+
 	if n.Inventory == "" {
 		return nil, nil
 	}

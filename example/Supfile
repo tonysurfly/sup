@@ -34,6 +34,10 @@ networks:
   k8s:
     inventory: for i in $(kubectl get nodes -o jsonpath={.items[*].status.addresses[?\(@.type==\"InternalIP\"\)].address}); do echo "ubuntu@$i"; done
 
+  webservers:
+    ansible_inventory: example/inventory.ansible.yml
+    ansible_group: webservers
+
 commands:
   # Named set of commands to be run remotely
   ping:
@@ -122,7 +126,8 @@ commands:
 
   slack-notify:
     desc: Notify Slack about new deployment
-    local: >
+    local: true
+    run: >
       curl -X POST --data-urlencode 'payload={"channel": "#_team_", "text": "['$SUP_NETWORK'] '$SUP_USER' deployed '$NAME'"}' \
         https://hooks.slack.com/services/X/Y/Z
 
